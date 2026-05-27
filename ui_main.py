@@ -3,8 +3,43 @@ from tkinter import ttk, messagebox
 from config import COLORS, STATUS_MAP
 from db import (get_experiments, get_experiment, add_experiment, update_experiment,
                 delete_experiment, get_phases, add_phase, get_metrics, add_metrics,
-                clear_metrics, set_hyperparams, get_hyperparams)
+                clear_metrics)
 from ui_dialog import ExperimentDialog, MetricsImportDialog
+
+# 科研进度排序：Phase 内的实验按优先级排
+ROUTER_ORDER = {
+    "fixed": 0, "progressive": 1, "R1": 2, "R2": 3, "R3": 4, "R4": 5,
+}
+STATUS_ORDER = {"running": 0, "planned": 1, "completed": 2, "failed": 3}
+
+GUIDE_TEXT = """【操作指南】
+
+1. 新建实验
+   点击顶部 [+ 新建实验]，填写配置后保存
+
+2. 编辑实验
+   选中实验 → 右侧详情 → 点 [编辑]
+
+3. 导入训练指标
+   选中实验 → [导入指标] → 粘贴 CSV 数据
+   格式: epoch,train_loss,val_loss,train_acc,val_acc
+
+4. 查看训练曲线
+   选中实验 → [查看曲线]（需先导入指标）
+
+5. 对比实验
+   按住 Ctrl 多选 → 点 [对比选中]
+
+6. 导出论文表格
+   点 [导出表格] → Markdown 自动复制到剪贴板
+
+7. 排序
+   左侧 [排序] 下拉框选择排序方式
+
+【科研顺序】
+   Phase 1 → Phase 2 → Phase 3 → Phase 4
+   先跑基线(FIX)，再跑路由器(R1)，最后对比汇总
+"""
 
 
 class MainWindow:
@@ -13,7 +48,6 @@ class MainWindow:
         self.root.title("实验记录管理器")
         self.root.configure(bg=COLORS["bg"])
         self.root.geometry("1100x700")
-
         self._selected_exp = None
         self._build()
 
@@ -26,18 +60,19 @@ class MainWindow:
         tk.Label(toolbar, text="实验记录管理器", font=("Microsoft YaHei", 14, "bold"),
                  bg=COLORS["bg2"], fg=COLORS["fg"]).pack(side=tk.LEFT, padx=16)
 
+        tk.Button(toolbar, text="? 操作指南", command=self._show_guide,
+                  font=("Microsoft YaHei", 10), relief=tk.FLAT, padx=12).pack(side=tk.RIGHT, padx=8, pady=8)
         tk.Button(toolbar, text="+ 新建实验", command=self._new_exp,
                   font=("Microsoft YaHei", 10), bg=COLORS["accent"], fg="white",
-                  relief=tk.FLAT, padx=12).pack(side=tk.RIGHT, padx=8, pady=8)
+                  relief=tk.FLAT, padx=12).pack(side=tk.RIGHT, padx=4, pady=8)
         tk.Button(toolbar, text="对比选中", command=self._compare,
                   font=("Microsoft YaHei", 10), relief=tk.FLAT, padx=12).pack(side=tk.RIGHT, padx=4, pady=8)
         tk.Button(toolbar, text="导出表格", command=self._export_md,
                   font=("Microsoft YaHei", 10), relief=tk.FLAT, padx=12).pack(side=tk.RIGHT, padx=4, pady=8)
 
-        # 分隔线
         tk.Frame(self.root, height=1, bg=COLORS["border"]).pack(fill=tk.X)
 
-        # 主体区域
+        # 主体
         body = tk.Frame(self.root, bg=COLORS["bg"])
         body.pack(fill=tk.BOTH, expand=True)
 
@@ -46,25 +81,36 @@ class MainWindow:
         left.pack(side=tk.LEFT, fill=tk.Y)
         left.pack_propagate(False)
 
-        # 筛选
+        # 筛选 + 排序
         filter_frame = tk.Frame(left, bg=COLORS["bg2"], padx=8, pady=8)
         filter_frame.pack(fill=tk.X)
 
-        tk.Label(filter_frame, text="筛选", font=("Microsoft YaHei", 9, "bold"),
+        tk.Label(filter_frame, text="筛选与排序", font=("Microsoft YaHei", 9, "bold"),
                  bg=COLORS["bg2"], fg=COLORS["fg2"]).pack(anchor="w")
 
         self.filter_phase = tk.StringVar(value="全部")
         self.filter_status = tk.StringVar(value="全部")
         self.filter_router = tk.StringVar(value="全部")
+        self.sort_var = tk.StringVar(value="科研顺序")
 
         row = tk.Frame(filter_frame, bg=COLORS["bg2"])
         row.pack(fill=tk.X, pady=4)
         self._mini_combo(row, "Phase", self.filter_phase, self._get_phase_names())
         self._mini_combo(row, "状态", self.filter_status, ["全部"] + list(STATUS_MAP.keys()))
-        self._mini_combo(row, "路由器", self.filter_router, ["全部", "fixed", "progressive", "R1", "R2", "R3", "R4"])
 
-        for var in [self.filter_phase, self.filter_status, self.filter_router]:
+        row2 = tk.Frame(filter_frame, bg=COLORS["bg2"])
+        row2.pack(fill=tk.X, pady=4)
+        self._mini_combo(row2, "路由器", self.filter_router, ["全部", "fixed", "progressive", "R1", "R2", "R3", "R4"])
+        self._mini_combo(row2, "排序", self.sort_var,
+                         ["科研顺序", "Phase顺序", "状态", "名称", "精度高→低", "精度低→高"])
+
+        for var in [self.filter_phase, self.filter_status, self.filter_router, self.sort_var]:
             var.trace_add("write", lambda *_: self._refresh_list())
+
+        # 进度概览
+        self.progress_frame = tk.Frame(left, bg=COLORS["bg2"], padx=8, pady=4)
+        self.progress_frame.pack(fill=tk.X)
+        self._build_progress()
 
         # 实验列表
         list_frame = tk.Frame(left, bg=COLORS["bg2"])
@@ -85,6 +131,28 @@ class MainWindow:
 
         self._build_detail_empty()
         self._refresh_list()
+
+    def _build_progress(self):
+        for w in self.progress_frame.winfo_children():
+            w.destroy()
+        exps = get_experiments()
+        total = len(exps)
+        done = sum(1 for e in exps if e["status"] == "completed")
+        running = sum(1 for e in exps if e["status"] == "running")
+        planned = sum(1 for e in exps if e["status"] == "planned")
+
+        tk.Label(self.progress_frame,
+                 text=f"进度: {done}/{total} 完成 | {running} 进行中 | {planned} 待做",
+                 font=("Microsoft YaHei", 9), bg=COLORS["bg2"], fg=COLORS["fg2"]).pack(anchor="w")
+
+        # 进度条
+        bar_frame = tk.Frame(self.progress_frame, bg=COLORS["border"], height=6)
+        bar_frame.pack(fill=tk.X, pady=4)
+        bar_frame.pack_propagate(False)
+        if total > 0:
+            done_width = int(300 * done / total)
+            if done_width > 0:
+                tk.Frame(bar_frame, bg=COLORS["success"], width=done_width).pack(side=tk.LEFT, fill=tk.Y)
 
     def _get_phase_names(self):
         phases = get_phases()
@@ -107,8 +175,6 @@ class MainWindow:
         status_filter = self.filter_status.get()
         router_filter = self.filter_router.get()
 
-        phases = {p["name"]: p["id"] for p in get_phases()}
-
         for exp in self._exps:
             if phase_filter != "全部" and exp.get("phase_name") != phase_filter:
                 continue
@@ -118,9 +184,33 @@ class MainWindow:
                 continue
             self._filtered.append(exp)
 
-        for exp in self._filtered:
+        # 排序
+        sort_mode = self.sort_var.get()
+        if sort_mode == "科研顺序":
+            self._filtered.sort(key=lambda e: (
+                e.get("phase_id") or 99,
+                ROUTER_ORDER.get(e["router_type"], 99),
+                e["name"]
+            ))
+        elif sort_mode == "Phase顺序":
+            self._filtered.sort(key=lambda e: (e.get("phase_id") or 99, e["name"]))
+        elif sort_mode == "状态":
+            self._filtered.sort(key=lambda e: (STATUS_ORDER.get(e["status"], 99), e["name"]))
+        elif sort_mode == "名称":
+            self._filtered.sort(key=lambda e: e["name"])
+        elif sort_mode == "精度高→低":
+            self._filtered.sort(key=lambda e: -(e.get("best_acc") or 0))
+        elif sort_mode == "精度低→高":
+            self._filtered.sort(key=lambda e: (e.get("best_acc") or 999))
+
+        for i, exp in enumerate(self._filtered):
             status_icon = STATUS_MAP.get(exp["status"], ("", ""))[0]
-            self.exp_list.insert(tk.END, f"{status_icon} {exp['name']}")
+            phase = exp.get("phase_name", "")
+            phase_short = phase.split(":")[0] if ":" in phase else phase
+            prefix = f"[{phase_short}] " if phase_short else ""
+            self.exp_list.insert(tk.END, f"{status_icon} {prefix}{exp['name']}")
+
+        self._build_progress()
 
     def _on_select(self, event):
         sel = self.exp_list.curselection()
@@ -134,8 +224,9 @@ class MainWindow:
     def _build_detail_empty(self):
         for w in self.detail_frame.winfo_children():
             w.destroy()
-        tk.Label(self.detail_frame, text="选择左侧实验查看详情",
-                 font=("Microsoft YaHei", 12), bg=COLORS["bg"], fg=COLORS["fg2"]).pack(expand=True)
+        tk.Label(self.detail_frame, text="选择左侧实验查看详情\n\n按科研顺序排列：先 Phase 1 基线，再 Phase 2 路由器",
+                 font=("Microsoft YaHei", 11), bg=COLORS["bg"], fg=COLORS["fg2"],
+                 justify=tk.CENTER).pack(expand=True)
 
     def _show_detail(self, exp):
         for w in self.detail_frame.winfo_children():
@@ -144,7 +235,6 @@ class MainWindow:
         canvas = tk.Canvas(self.detail_frame, bg=COLORS["bg"], highlightthickness=0)
         scrollbar = ttk.Scrollbar(self.detail_frame, orient=tk.VERTICAL, command=canvas.yview)
         inner = tk.Frame(canvas, bg=COLORS["bg"])
-
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=inner, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
@@ -174,29 +264,24 @@ class MainWindow:
         tk.Button(btn_row, text="删除", command=lambda: self._delete_exp(exp),
                   font=("Microsoft YaHei", 9), fg=COLORS["danger"], relief=tk.FLAT, padx=8).pack(side=tk.RIGHT, padx=2)
 
-        # 信息卡片
         self._info_card(f, "基本信息", [
             ("Phase", exp.get("phase_name", "-")),
             ("路由器", exp["router_type"]),
             ("数据集", exp["dataset"]),
             ("备注", exp.get("notes", "") or "-"),
         ])
-
         self._info_card(f, "模型配置", [
             ("dim", str(exp["dim"])),
             ("depth", str(exp["depth"])),
             ("max_latents", str(exp["max_latents"])),
             ("patch_size", str(exp["patch_size"])),
         ])
-
         self._info_card(f, "训练配置", [
             ("epochs", str(exp["epochs"])),
             ("batch_size", str(exp["batch_size"])),
             ("lr", str(exp["lr"])),
             ("optimizer", exp["optimizer"]),
         ])
-
-        # 结果
         if exp.get("best_acc") or exp.get("flops"):
             self._info_card(f, "实验结果", [
                 ("Best Acc", f"{exp['best_acc']}%" if exp.get("best_acc") else "-"),
@@ -205,16 +290,14 @@ class MainWindow:
                 ("FLOPs", exp.get("flops") or "-"),
                 ("训练时间", exp.get("train_time") or "-"),
             ])
-
-        # 训练指标摘要
         metrics = get_metrics(exp["id"])
         if metrics:
             last = metrics[-1]
             self._info_card(f, f"训练指标（共 {len(metrics)} 个 epoch）", [
-                ("最后 train_loss", f"{last['train_loss']:.4f}" if last.get("train_loss") else "-"),
-                ("最后 val_loss", f"{last['val_loss']:.4f}" if last.get("val_loss") else "-"),
-                ("最后 train_acc", f"{last['train_acc']:.2f}%" if last.get("train_acc") else "-"),
-                ("最后 val_acc", f"{last['val_acc']:.2f}%" if last.get("val_acc") else "-"),
+                ("train_loss", f"{last['train_loss']:.4f}" if last.get("train_loss") else "-"),
+                ("val_loss", f"{last['val_loss']:.4f}" if last.get("val_loss") else "-"),
+                ("train_acc", f"{last['train_acc']:.2f}%" if last.get("train_acc") else "-"),
+                ("val_acc", f"{last['val_acc']:.2f}%" if last.get("val_acc") else "-"),
             ])
 
     def _info_card(self, parent, title, items):
@@ -229,6 +312,18 @@ class MainWindow:
                      bg=COLORS["bg2"], fg=COLORS["fg2"]).pack(side=tk.LEFT)
             tk.Label(row, text=str(val), font=("Microsoft YaHei", 10),
                      bg=COLORS["bg2"], fg=COLORS["fg"], anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def _show_guide(self):
+        win = tk.Toplevel(self.root)
+        win.title("操作指南")
+        win.configure(bg=COLORS["bg2"])
+        win.geometry("500x520")
+        win.transient(self.root)
+        text = tk.Text(win, font=("Microsoft YaHei", 11), bg=COLORS["bg2"], fg=COLORS["fg"],
+                       relief=tk.FLAT, padx=20, pady=16, wrap=tk.WORD)
+        text.pack(fill=tk.BOTH, expand=True)
+        text.insert("1.0", GUIDE_TEXT)
+        text.configure(state=tk.DISABLED)
 
     def _new_exp(self):
         phases = get_phases()
@@ -283,16 +378,15 @@ class MainWindow:
         if not self._filtered:
             messagebox.showinfo("提示", "没有实验数据")
             return
-        lines = ["| 方法 | Acc@1 | FLOPs | avg_k | 训练时间 | 状态 |",
-                 "|------|-------|-------|-------|---------|------|"]
+        lines = ["| 方法 | 路由器 | Acc@1 | FLOPs | avg_k | 训练时间 | 状态 |",
+                 "|------|--------|-------|-------|-------|---------|------|"]
         for exp in self._filtered:
             acc = f"{exp['best_acc']}%" if exp.get("best_acc") else "?"
             flops = exp.get("flops") or "?"
             avg_k = str(exp["avg_latents"]) if exp.get("avg_latents") else "?"
             t = exp.get("train_time") or "?"
             status = STATUS_MAP.get(exp["status"], ("?",))[0]
-            lines.append(f"| {exp['name']} | {acc} | {flops} | {avg_k} | {t} | {status} |")
-
+            lines.append(f"| {exp['name']} | {exp['router_type']} | {acc} | {flops} | {avg_k} | {t} | {status} |")
         md = "\n".join(lines)
         self.root.clipboard_clear()
         self.root.clipboard_append(md)
